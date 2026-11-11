@@ -1,0 +1,94 @@
+name: Build
+
+# On every push to main: builds the game for each platform and replaces the rolling `latest` prerelease with the zips.
+# A `v*` tag makes a draft release of them instead, for a human to review and publish.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "LICENSE"]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, os: ubuntu-22.04 }
+          - { platform: macos-arm64, os: macos-latest }
+          - { platform: windows-x86_64, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build against the engine
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/build.sh ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-${{ matrix.platform }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: game-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: sha256sum -- *.zip | tee SHA256SUMS
+
+      - name: Draft release (tag)
+        if: github.ref_type == 'tag'
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --generate-notes \
+            dist/*.zip dist/SHA256SUMS
+
+      - name: Replace the latest build (main)
+        if: github.ref_type == 'branch'
+        run: |
+          engine="$(tr -d '[:space:]' < engine-version.txt)"
+          cat > notes.md <<EOF
+          Build of \`main\` (commit ${SHA}) against the AYLO Engine release \`${engine}\`.
+
+          Each zip is the game exported with \`aylo-export\`: unzip it and run \`play.sh\` (\`play.bat\` on Windows).
+          It needs a graphics driver with Vulkan support. The zips are not signed: your system may warn on first start.
+          EOF
+          git tag -f latest "$SHA"
+          git push -f origin refs/tags/latest
+          if gh release view latest > /dev/null 2>&1; then
+            gh release view latest --json assets --jq '.assets[].name' \
+              | while IFS= read -r asset; do gh release delete-asset latest "$asset" --yes; done
+            gh release edit latest --title "Latest ${SHA:0:7}" --notes-file notes.md --prerelease
+          else
+            gh release create latest --verify-tag --title "Latest ${SHA:0:7}" --notes-file notes.md --prerelease
+          fi
+          gh release upload latest dist/*.zip dist/SHA256SUMS --clobber
